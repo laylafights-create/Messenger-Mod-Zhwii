@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Confirm that a changed Messenger DEX fails before Morphe writes an APK."""
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import zlib
+from pathlib import Path
+from zipfile import BadZipFile, ZipFile
+
+if __package__:
+    from . import desktop_result
+    from .build_queue import queued, time_limit
+    from .check_release import run_bounded
+else:
+    import desktop_result
+    from build_queue import queued, time_limit
+    from check_release import run_bounded
+
+PROFILES =Path(__file__).resolve().parent / "profiles"
+
+
+def recorded_builds(directory: Path = PROFILES) -> dict[int, str]:
+    """Version code to SHA-256 for each build CompatReport.java recorded."""
+    builds = {}
+    for path in sorted(directory.glob("*.txt")):
+        fields = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(" ")
+            if key in ("code", "sha256"):
+                fields[key] = value
+        try:
+            builds[int(fields["code"])] = fields["sha256"]
+        except (KeyError, ValueError) as error:
+            raise ValueError(f"{path.name} is missing a code or sha256 line") from error
+    return builds
+
+
+try:
+    BUILDS = recorded_builds()
+    PROFILE_ERROR = None
+except (OSError, ValueError) as error:
+    # A broken record has to read as CHECK FAILED (exit 2) from main, never as a traceback with exit 1.
+    BUILDS = {}
+    PROFILE_ERROR = f"The recorded builds can't be read: {error}"
+STOCK_SHA256 = set(BUILDS.values())
+OLD_LITERAL = b"com.facebook.permission.prod.FB_APP_COMMUNICATION"
+CHANGED_LITERAL = b"com.facebook.permission.proX.FB_APP_COMMUNICATION"
+
+
+def altered_dex(data: bytes) -> bytes:
+    changed = bytearray(data.replace(OLD_LITERAL, CHANGED_LITERAL))
+    # DEX mandates SHA-1 for this header checksum; it is not APK authentication.
+    changed[12:32] = hashlib.sha1(changed[32:], usedforsecurity=False).digest()
+    changed[8:12] = (zlib.adler32(changed[12:]) & 0xFFFFFFFF).to_bytes(4, "little")
+    return bytes(changed)
+
+
+def names_every_build(line: str) -> bool:
+    """The DEX-site rejection, naming every recorded build as a supported version code."""
+    match = re.search(r"\bexpected 3 permission loads, found 1\b(.*)", line)
+    if match is None:
+        return False
+    named = {
+        int(code)
+        for codes in re.findall(r"\bversion code (\d+(?: or \d+)*)\b", match.group(1))
+        for code in codes.split(" or ")
+    }
+    return named == set(BUILDS)
+
+
+def check(args: argparse.Namespace) -> int:
+    with args.stock_apk.open("rb") as source:
+        actual_hash = hashlib.file_digest(source, "sha256").hexdigest()
+    if actual_hash not in STOCK_SHA256:
+        raise ValueError(f"stock APK SHA-256 mismatch: {actual_hash}")
+
+    with tempfile.TemporaryDirectory(prefix="hushmessenger-drift-") as scratch:
+        root = Path(scratch)
+        changed_apk = root / "changed.apk"
+        output_apk = root / "unexpected-output.apk"
+        report_path = root / "result.json"
+        changed_sites = 0
+        with ZipFile(args.stock_apk) as source, ZipFile(changed_apk, "w") as target:
+            for entry in source.infolist():
+                data = source.read(entry.filename)
+                if entry.filename.endswith(".dex") and OLD_LITERAL in data:
+                    changed_sites += data.count(OLD_LITERAL)
+                    data = altered_dex(data)
+                target.writestr(entry, data)
+        if changed_sites != 2:
+            raise RuntimeError(
+                f"expected two stock DEX literals, found {changed_sites}"
+            )
+
+        command = [
+            str(args.java),
+            "-jar",
+            str(args.desktop_jar),
+            "patch",
+            f"-p={args.bundle}",
+            "--unsigned",
+            f"-r={report_path}",
+            f"-o={output_apk}",
+            str(changed_apk),
+        ]
+        run = run_bounded(
+            queued(command, "hushmessenger changed APK check"),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=time_limit(300),
+        )
+        log = run.stdout + run.stderr
+        if not report_path.is_file():
+            # Java failing to start Desktop (bad jar path, old JDK) never writes a report.
+            print(log[-4000:])
+            raise RuntimeError(
+                f"Desktop exited {run.returncode} without writing a patch report"
+            )
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if not isinstance(report, dict):
+            raise TypeError("Desktop did not write a patch result object")
+        try:
+            failed = desktop_result.failures(report)
+        except ValueError as error:
+            raise ValueError("Desktop wrote an incomplete or malformed patch result") from error
+        steps = desktop_result.steps(report)
+        if not isinstance(steps, list) or any(
+            not isinstance(step, dict)
+            or not isinstance(step.get("step"), str)
+            or not isinstance(step.get("success"), bool)
+            for step in steps
+        ):
+            raise ValueError("Desktop wrote an incomplete or malformed patch result")
+        patch_failure = next(
+            (reason for name, reason in failed if name == "Install beside Meta apps"),
+            None,
+        )
+        if (
+            output_apk.exists()
+            or run.returncode == 0
+            or patch_failure is None
+            or any(step.get("step") in ("REBUILDING", "SIGNING") for step in steps)
+        ):
+            print(log[-4000:])
+            print(json.dumps(report, sort_keys=True))
+            raise RuntimeError("changed APK was not rejected by the permission patch")
+        reason = next(
+            (
+                line.strip()
+                for line in patch_failure.splitlines()
+                if names_every_build(line)
+            ),
+            None,
+        )
+        if reason is None:
+            print(patch_failure.partition("\n")[0].rstrip("\r"))
+            raise RuntimeError(
+                "failure did not identify the changed permission DEX sites"
+            )
+        print(f"Changed APK rejected before output: {reason}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stock-apk", type=Path, required=True)
+    parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--desktop-jar", type=Path, required=True)
+    parser.add_argument("--java", type=Path, default=Path("java"))
+    args = parser.parse_args()
+    try:
+        if PROFILE_ERROR:
+            raise ValueError(PROFILE_ERROR)
+        return check(args)
+    except subprocess.TimeoutExpired:
+        print("CHECK FAILED: Desktop exceeded the 300-second limit.", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, TypeError, RuntimeError, BadZipFile) as error:
+        print(f"CHECK FAILED: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

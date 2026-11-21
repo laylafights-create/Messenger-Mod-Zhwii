@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Changed-APK checker failures must preserve inputs and remove temporary files."""
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+import zlib
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+from zipfile import ZipFile
+
+from scripts import verify_changed_apk_failure as checker
+
+# The Kotlin message follows its own table order; the check accepts any order.
+SUPPORTED = " or ".join(str(code) for code in reversed(checker.BUILDS))
+LAST_BUILD = str(next(iter(checker.BUILDS)))
+REASON = f"expected 3 permission loads, found 1; use version code {SUPPORTED}"
+WRAPPED_REASON = (
+    'app.morphe.patcher.patch.PatchException: The patch "Install beside Meta apps" '
+    'depends on "ResourcePatch@1179093020", which raised an exception:\r\n'
+    'app.morphe.patcher.patch.PatchException: The patch "ResourcePatch@1179093020" '
+    'depends on "BytecodePatch@1727420902", which raised an exception:\r\n'
+    "app.morphe.patcher.patch.PatchException: Install beside Meta apps: "
+    "expected 3 permission loads, found 1. Use an unmodified Messenger "
+    f"587.0.0.54.96 APK (version code {SUPPORTED}).\r\r\n"
+    "\tat app.hushmessenger.patches.coexist.InstallBesideMetaAppsPatchKt.validateDexSites(InstallBesideMetaAppsPatch.kt:203)\r\n"
+)
+
+
+def report():
+    return {
+        "failedPatches": [
+            {"patch": {"name": "Install beside Meta apps"}, "reason": REASON}
+        ],
+        "patchingSteps": [{"step": "PATCHING", "success": False}],
+    }
+
+
+def setUpModule():
+    # These tests check the plain command lines, so keep this PC's build queue out of them.
+    queue_off = patch.dict(
+        os.environ, {"HUSHMESSENGER_BUILD_WRAPPER": "", "BUILD_QUEUE_SCRIPT": ""}
+    )
+    queue_off.start()
+    unittest.addModuleCleanup(queue_off.stop)
+
+
+class ChangedApkChecks(unittest.TestCase):
+    def test_a_broken_build_record_is_a_check_failure_not_a_traceback(self):
+        argv = ["verify_changed_apk_failure.py", "--stock-apk", "s.apk", "--bundle", "b.mpp", "--desktop-jar", "d.jar"]
+        output = io.StringIO()
+        with (
+            patch("sys.argv", argv),
+            patch.object(checker, "PROFILE_ERROR", "The recorded builds can't be read: 1.txt is missing a code or sha256 line"),
+            patch.object(checker, "check", side_effect=AssertionError("the check must not run on broken records")),
+            redirect_stderr(output),
+        ):
+            self.assertEqual(2, checker.main())
+        self.assertIn("CHECK FAILED: The recorded builds can't be read", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "1.txt").write_text("code 1\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "1.txt is missing a code or sha256 line"):
+                checker.recorded_builds(Path(folder))
+
+    def test_dex_checksum_and_signature_are_updated_after_literal_change(self):
+        data = b"dex\n035\0" + bytes(56) + checker.OLD_LITERAL
+        changed = checker.altered_dex(data)
+        self.assertNotIn(checker.OLD_LITERAL, changed)
+        self.assertIn(checker.CHANGED_LITERAL, changed)
+        self.assertEqual(
+            changed[12:32], hashlib.sha1(changed[32:], usedforsecurity=False).digest()
+        )
+        self.assertEqual(
+            int.from_bytes(changed[8:12], "little"),
+            zlib.adler32(changed[12:]) & 0xFFFFFFFF,
+        )
+        self.assertEqual(len(data), len(changed))
+
+    def test_rejection_report_and_error_paths_keep_stock_and_clean_temporary_apks(self):
+        cases = [
+            "valid",
+            "wrapped-reason",
+            "step-results",
+            "step-results-rebuild",
+            "step-results-missing",
+            "desktop-1.19",
+            "desktop-1.19-no-error",
+            "desktop-1.19-other-patch",
+            "output",
+            "exit-zero",
+            "rebuild",
+            "reason",
+            "wrapped-unrelated",
+            "wrapped-count-prefix",
+            "wrapped-build-prefix",
+            "split-reason",
+            "report-array",
+            "missing-fields",
+            "malformed-patch",
+            "malformed-step",
+            "missing-report",
+            "timeout",
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            stock = Path(root) / "stock.apk"
+            with ZipFile(stock, "w") as archive:
+                archive.writestr(
+                    "classes.dex", b"dex\n035\0" + bytes(56) + checker.OLD_LITERAL
+                )
+                archive.writestr(
+                    "classes2.dex", b"dex\n035\0" + bytes(56) + checker.OLD_LITERAL
+                )
+            original = stock.read_bytes()
+            digest = hashlib.sha256(original).hexdigest()
+            args = argparse.Namespace(
+                stock_apk=stock,
+                bundle=Path("patches.mpp"),
+                desktop_jar=Path("desktop.jar"),
+                java=Path("java"),
+            )
+            for case in cases:
+                scratch = []
+
+                def desktop(command, case=case, scratch=scratch, **kwargs):
+                    changed = Path(command[-1])
+                    scratch.append(changed.parent)
+                    self.assertTrue(changed.exists())
+                    self.assertNotEqual(changed.resolve(), stock.resolve())
+                    if case == "timeout":
+                        raise subprocess.TimeoutExpired(command, 300)
+                    outcome = report()
+                    if case == "wrapped-reason":
+                        outcome["failedPatches"][0]["reason"] = WRAPPED_REASON
+                    if case == "output":
+                        Path(
+                            next(arg[3:] for arg in command if arg.startswith("-o="))
+                        ).write_bytes(b"unexpected")
+                    if case == "step-results-rebuild":
+                        outcome["patchingSteps"].append(
+                            {"step": "REBUILDING", "success": False}
+                        )
+                    # Desktop 1.19.0 renamed patchingSteps to stepResults.
+                    if case in {"step-results", "step-results-rebuild"}:
+                        outcome["stepResults"] = outcome.pop("patchingSteps")
+                    if case == "step-results-missing":
+                        outcome.pop("patchingSteps")
+                    # Desktop 1.19.0 writes PatchEngine.Result: {name, error} failures and stepResults.
+                    if case.startswith("desktop-1.19"):
+                        outcome = {
+                            "success": False,
+                            "appliedPatches": [],
+                            "failedPatches": [
+                                {"name": "Install beside Meta apps", "error": WRAPPED_REASON}
+                            ],
+                            "stepResults": [
+                                {"step": "PATCHING", "success": False, "error": "1 patch failed"}
+                            ],
+                        }
+                    if case == "desktop-1.19-no-error":
+                        outcome["failedPatches"][0]["error"] = None
+                    if case == "desktop-1.19-other-patch":
+                        outcome["failedPatches"][0]["name"] = "Material You theme"
+                    if case == "rebuild":
+                        outcome["patchingSteps"].append(
+                            {"step": "REBUILDING", "success": False}
+                        )
+                    if case == "reason":
+                        outcome["failedPatches"][0]["reason"] = "unrelated failure"
+                    if case == "wrapped-unrelated":
+                        outcome["failedPatches"][0]["reason"] = WRAPPED_REASON.replace(
+                            "expected 3 permission loads, found 1",
+                            "expected 3 permission loads, found 2",
+                        )
+                    if case == "wrapped-count-prefix":
+                        outcome["failedPatches"][0]["reason"] = WRAPPED_REASON.replace(
+                            "found 1.", "found 10."
+                        )
+                    if case == "wrapped-build-prefix":
+                        outcome["failedPatches"][0]["reason"] = WRAPPED_REASON.replace(
+                            f"{LAST_BUILD})", f"{LAST_BUILD}0)"
+                        )
+                    if case == "split-reason":
+                        outcome["failedPatches"][0]["reason"] = (
+                            "expected 3 permission loads, found 1\n"
+                            f"unrelated error on version code {SUPPORTED}"
+                        )
+                    if case == "report-array":
+                        outcome = []
+                    if case == "missing-fields":
+                        outcome = {"failedPatches": report()["failedPatches"]}
+                    if case == "malformed-patch":
+                        outcome["failedPatches"] = [None]
+                    if case == "malformed-step":
+                        outcome["patchingSteps"] = [None]
+                    if case != "missing-report":
+                        Path(
+                            next(arg[3:] for arg in command if arg.startswith("-r="))
+                        ).write_text(json.dumps(outcome), encoding="utf-8")
+                    return subprocess.CompletedProcess(
+                        command, 0 if case == "exit-zero" else 1, "", ""
+                    )
+
+                with (
+                    self.subTest(case=case),
+                    patch.object(checker, "STOCK_SHA256", {digest}),
+                    patch.object(checker, "run_bounded", side_effect=desktop),
+                    redirect_stdout(io.StringIO()),
+                ):
+                    if case in {"valid", "wrapped-reason", "step-results", "desktop-1.19"}:
+                        self.assertEqual(checker.check(args), 0)
+                    elif case == "missing-report":
+                        # Desktop that never started must say so, not point at a deleted temp file.
+                        with self.assertRaisesRegex(
+                            RuntimeError, "without writing a patch report"
+                        ):
+                            checker.check(args)
+                    else:
+                        with self.assertRaises(
+                            (
+                                OSError,
+                                ValueError,
+                                TypeError,
+                                RuntimeError,
+                                subprocess.TimeoutExpired,
+                            )
+                        ):
+                            checker.check(args)
+                self.assertEqual(stock.read_bytes(), original)
+                self.assertTrue(scratch)
+                self.assertTrue(all(not path.exists() for path in scratch))
+
+    def test_missing_input_timeout_and_malformed_report_have_cli_diagnostics(self):
+        argv = [
+            "verify_changed_apk_failure.py",
+            "--stock-apk",
+            "missing.apk",
+            "--bundle",
+            "bundle.mpp",
+            "--desktop-jar",
+            "desktop.jar",
+        ]
+        for error in (
+            FileNotFoundError("missing APK"),
+            subprocess.TimeoutExpired(["java", "private-path"], 300),
+            ValueError("malformed report"),
+        ):
+            output = io.StringIO()
+            with (
+                self.subTest(error=error),
+                patch("sys.argv", argv),
+                patch.object(checker, "check", side_effect=error),
+                redirect_stderr(output),
+            ):
+                self.assertEqual(checker.main(), 2)
+                self.assertIn("CHECK FAILED:", output.getvalue())
+                self.assertNotIn("Traceback", output.getvalue())
+                self.assertNotIn("private-path", output.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()
