@@ -7,9 +7,14 @@ permissions:
   contents: read
   packages: read
 
+concurrency:
+  group: build-mpp-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -18,7 +23,15 @@ jobs:
           distribution: temurin
           java-version: 21
 
-      - uses: android-actions/setup-android@v3
+      # Caches Gradle downloads, so a second run is much faster.
+      - uses: gradle/actions/setup-gradle@v4
+
+      # The runner already ships the Android SDK: accept licenses and make sure platform 36 is there.
+      - name: Prepare Android SDK
+        run: |
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          (yes || true) | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-36" || true
 
       - name: Build the .mpp
         env:
@@ -26,9 +39,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           chmod +x ./gradlew
-          ./gradlew :patches:buildAndroid --no-daemon
+          ./gradlew :patches:buildAndroid --no-daemon --stacktrace
 
       - uses: actions/upload-artifact@v4
         with:
           name: patches-bundle
           path: patches/build/libs/*.mpp
+          if-no-files-found: error
