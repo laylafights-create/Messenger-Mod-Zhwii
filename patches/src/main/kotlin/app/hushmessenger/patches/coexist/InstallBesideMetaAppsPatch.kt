@@ -1,0 +1,328 @@
+/*
+ * Adapted from Hushfacebook's SharedPermissions.kt at
+ * https://github.com/SysAdminDoc/Hushfacebook/blob/15b8e9ed9315464a3e2d1a821b4e26ad47bbc28c/patches/src/main/kotlin/app/morphe/patches/facebook/coexist/SharedPermissions.kt
+ * Copyright 2026 Hushfacebook contributors. GPL-3.0.
+ */
+package app.hushmessenger.patches.coexist
+
+import app.hushmessenger.patches.MessengerTarget
+import app.hushmessenger.patches.isExtension
+import app.morphe.patcher.StringComparisonType
+import app.morphe.patcher.extensions.InstructionExtensions.getInstruction
+import app.morphe.patcher.extensions.InstructionExtensions.replaceInstruction
+import app.morphe.patcher.patch.PatchException
+import app.morphe.patcher.patch.classDefByStrings
+import app.morphe.patcher.patch.document
+import app.morphe.patcher.patch.mutableClassDefBy
+import app.morphe.patcher.patch.packageMetadata
+import app.morphe.patcher.patch.patch
+import app.morphe.patcher.util.proxy.mutableTypes.MutableMethod
+import com.android.tools.smali.dexlib2.Opcode
+import com.android.tools.smali.dexlib2.iface.Method
+import com.android.tools.smali.dexlib2.iface.instruction.Instruction
+import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
+import com.android.tools.smali.dexlib2.iface.reference.StringReference
+import org.w3c.dom.Document
+import org.w3c.dom.Element
+
+private const val PATCH_NAME = "Install beside Meta apps"
+private const val META_PREFIX = "com.facebook."
+private const val SHARED_PREFIX = "app.hushfacebook."
+private const val APP_COMMUNICATION = "com.facebook.permission.prod.FB_APP_COMMUNICATION"
+private const val RECEIVER_ACCESS = "com.facebook.receiver.permission.ACCESS"
+private const val APP_COMMUNICATION_FORMAT = "com.facebook.permission.%s.FB_APP_COMMUNICATION"
+
+private val sharedNames = listOf(APP_COMMUNICATION, RECEIVER_ACCESS)
+private val dexNames = sharedNames + APP_COMMUNICATION_FORMAT
+private val expectedManifestMentions = mapOf(APP_COMMUNICATION to 26, RECEIVER_ACCESS to 3)
+private val expectedManifestRoles = mapOf(
+    APP_COMMUNICATION to mapOf(
+        "permission:name" to 1,
+        "uses-permission:name" to 1,
+        "activity:permission" to 7,
+        "provider:permission" to 1,
+        "receiver:permission" to 13,
+        "service:permission" to 3,
+    ),
+    RECEIVER_ACCESS to mapOf(
+        "permission:name" to 1,
+        "uses-permission:name" to 1,
+        "receiver:permission" to 1,
+    ),
+)
+
+// Component names and instruction sites match every supported APK.
+internal val expectedGuardOwners = mapOf(
+    APP_COMMUNICATION to mapOf(
+        "activity" to setOf(
+            "com.facebook.messenger.intents.SecureIntentHandlerActivity",
+            "com.facebook.messenger.intents.SecureSameTaskIntentHandlerActivity",
+            "com.facebook.common.keyguard.KeyguardPendingIntentActivity",
+            "com.facebook.messaging.marketplace.viewlisting.ThreadNotificationViewListingActivity",
+            "com.facebook.messaging.integrity.supportinbox.ui.detail.MessengerSupportInboxItemDetailActivity",
+            "com.facebook.messaging.rtc.incall.activity.InCallActivity",
+            "com.facebook.messaging.threadmute.ThreadNotificationMuteDialogActivity",
+        ),
+        "provider" to setOf("com.facebook.messaging.push.dedup.provider.ClientMessagePushDedupInfoProvider"),
+        "receiver" to setOf(
+            "com.facebook.messaging.bubbles.shortcuts.BubblesShortcutsThreadsRemovedBroadcastReceiver",
+            "com.facebook.messaging.chatheads.service.ChatHeadsServiceBroadcastReceiver",
+            "com.facebook.messaging.notify.client.MessagesNotificationBroadcastReceiver",
+            "com.facebook.messaging.stella.contacts.StellaContactBroadcastReceiver",
+            "com.facebook.messaging.integrity.featurelimits.alarmmanager.FeatureLimitExpiredBroadcastReceiver",
+            "com.facebook.messaging.bubbles.receiver.BubblesBroadcastReceiver",
+            "com.facebook.conditionalworker.ConditionalWorkerServiceReceiver",
+            "com.facebook.messaging.livelocation.bindings.MessengerForegroundLiveLocationBroadcastReceiver",
+            "com.facebook.rtc.receivers.RtcStartCallReceiver",
+            "com.facebook.rtc.receivers.RtcShowCallUiReceiver",
+            "com.facebook.rtc.receivers.RtcPictureInPictureReceiver",
+            "com.facebook.push.negativefeedback.PushNegativeFeedbackReceiver",
+            "com.facebook.delayedworker.DelayedWorkerServiceReceiver",
+        ),
+        "service" to setOf(
+            "com.facebook.rtc.notification.metaai.MetaAiNotificationForegroundService",
+            "com.facebook.rtc.notification.RtcNotificationForegroundService",
+            "com.facebook.rp.platform.metaai.rsys.service.MetaAICallDismissalService",
+        ),
+    ),
+    RECEIVER_ACCESS to mapOf(
+        "receiver" to setOf("com.facebook.device_id.UniqueIdSupplier"),
+    ),
+)
+
+/** The three permission loads in 587.0.0.54.96's main arm64 build and the builds renamed from it. Generated from 347415354's record. */
+internal val expectedDexSites347415354 = mapOf(
+    "LX/0k8;->A00()Ljava/lang/String;@7" to APP_COMMUNICATION_FORMAT,
+    "LX/0yY;->A03()V@25" to APP_COMMUNICATION,
+    "LX/1h7;->A09(Lcom/facebook/auth/usersession/FbUserSession;LX/1h7;Ljava/lang/String;Ljava/lang/String;)V@34" to APP_COMMUNICATION,
+)
+
+/** The three permission loads in 587.0.0.54.96's other arm64 builds. Generated from 347415280's record. */
+internal val expectedDexSites347415280 = mapOf(
+    "LX/0k5;->A00()Ljava/lang/String;@7" to APP_COMMUNICATION_FORMAT,
+    "LX/0yd;->A03()V@25" to APP_COMMUNICATION,
+    "LX/1h7;->A0A(Lcom/facebook/auth/usersession/FbUserSession;LX/1h7;Ljava/lang/String;Ljava/lang/String;)V@34" to APP_COMMUNICATION,
+)
+
+/** The three permission loads in 587.0.0.54.96's armv7 builds. Generated from 347415262's record. */
+internal val expectedDexSites347415262 = mapOf(
+    "LX/0kT;->A00()Ljava/lang/String;@7" to APP_COMMUNICATION_FORMAT,
+    "LX/0zs;->A03()V@25" to APP_COMMUNICATION,
+    "LX/1hX;->A09(Lcom/facebook/auth/usersession/FbUserSession;LX/1hX;Ljava/lang/String;Ljava/lang/String;)V@34" to APP_COMMUNICATION,
+)
+
+/** The loads an unknown build is checked against. */
+internal val expectedDexSites = expectedDexSites347415354
+
+/** Each supported build's permission loads, by version code, as scripts/profiles records them. */
+internal val expectedDexSitesByBuild: Map<Int, Map<String, String>> = mapOf(
+    347415262 to expectedDexSites347415262,
+    347415267 to expectedDexSites347415354,
+    347415268 to expectedDexSites347415354,
+    347415280 to expectedDexSites347415280,
+    347415281 to expectedDexSites347415280,
+    347415284 to expectedDexSites347415280,
+    347415285 to expectedDexSites347415280,
+    347415295 to expectedDexSites347415262,
+    347415299 to expectedDexSites347415354,
+    347415301 to expectedDexSites347415354,
+    347415302 to expectedDexSites347415354,
+    347415333 to expectedDexSites347415354,
+    347415337 to expectedDexSites347415354,
+    347415348 to expectedDexSites347415262,
+    347415350 to expectedDexSites347415354,
+    347415351 to expectedDexSites347415354,
+    347415352 to expectedDexSites347415354,
+    347415354 to expectedDexSites347415354,
+    347415355 to expectedDexSites347415354,
+)
+
+internal fun expectedDexSitesFor(
+    versionCode: String?,
+    sites: Map<Int, Map<String, String>> = expectedDexSitesByBuild,
+): Map<String, String> = versionCode?.toIntOrNull()?.let(sites::get) ?: expectedDexSites
+
+private fun renamed(name: String): String =
+    SHARED_PREFIX + name.removePrefix(META_PREFIX)
+
+private fun unsupportedApk(reason: String, versions: Map<String, List<Int>> = MessengerTarget.VERSIONS) =
+    PatchException("$PATCH_NAME: $reason. Use an unmodified Messenger ${MessengerTarget.supportedApks(versions)}.")
+
+/**
+ * Every patch that touches Messenger runs this first, and Manager shows whichever dependent patch
+ * failed first ("Failed patch: Allow chat bubbles"). So the message opens with the build, not a
+ * patch name, for the line people read and paste.
+ */
+internal fun validateVersionCode(versionCode: String, versions: Map<String, List<Int>> = MessengerTarget.VERSIONS) {
+    if (versions.values.none { versionCode.toIntOrNull() in it }) {
+        throw PatchException(
+            "This Messenger build (version code $versionCode) isn't supported yet, so nothing was patched. " +
+                "Use an unmodified Messenger ${MessengerTarget.supportedApks(versions)}. " +
+                "APKMirror lists the version code of every download.",
+        )
+    }
+}
+
+/**
+ * Rename declarations, requests and guarded components together. Removing a declaration would
+ * let Messenger install but leave its signature-protected receivers and services unprotected.
+ */
+internal fun Document.renameSharedPermissions() {
+    val mentions = sharedNames.associateWith { mutableListOf<org.w3c.dom.Attr>() }
+    val declarations = sharedNames.associateWith { 0 }.toMutableMap()
+    val protectionLevels = mutableMapOf<String, String>()
+    val roles = sharedNames.associateWith { mutableMapOf<String, Int>() }
+    val guardOwners = sharedNames.associateWith { mutableMapOf<String, MutableSet<String>>() }
+    val renamedNames = sharedNames.map(::renamed).toSet()
+    val elements = getElementsByTagName("*")
+    for (i in 0 until elements.length) {
+        val element = elements.item(i) as? Element ?: continue
+        val attributes = element.attributes
+        for (j in 0 until attributes.length) {
+            val attr = attributes.item(j) as? org.w3c.dom.Attr ?: continue
+            if (attr.value in renamedNames) {
+                throw unsupportedApk("${attr.value} is already in the manifest")
+            }
+            if (attr.value !in sharedNames) continue
+            mentions.getValue(attr.value).add(attr)
+            val role = "${element.tagName}:${attr.nodeName.substringAfter(':')}"
+            roles.getValue(attr.value).merge(role, 1, Int::plus)
+            if (role.endsWith(":permission")) {
+                guardOwners.getValue(attr.value)
+                    .getOrPut(element.tagName) { mutableSetOf() }
+                    .add(element.getAttribute("android:name"))
+            }
+            if (element.tagName == "permission" && attr.nodeName.substringAfter(':') == "name") {
+                declarations[attr.value] = declarations.getValue(attr.value) + 1
+                protectionLevels[attr.value] = element.getAttribute("android:protectionLevel")
+            }
+        }
+    }
+    for (name in sharedNames) {
+        if (declarations.getValue(name) != 1) {
+            throw unsupportedApk("the manifest must declare $name exactly once")
+        }
+        val level = protectionLevels.getValue(name).trim()
+        val numericLevel = if (level.startsWith("0x", ignoreCase = true)) level.substring(2).toLongOrNull(16)
+            else level.toLongOrNull()
+        if (level != "signature" && numericLevel != 2L) {
+            throw unsupportedApk("the protection level for $name must remain signature (0x2)")
+        }
+        val actual = mentions.getValue(name).size
+        val expected = expectedManifestMentions.getValue(name)
+        if (actual != expected) {
+            throw unsupportedApk("expected $expected manifest uses of $name, found $actual")
+        }
+        if (roles.getValue(name) != expectedManifestRoles.getValue(name)) {
+            throw unsupportedApk("manifest roles for $name differ from the tested build")
+        }
+        if (guardOwners.getValue(name) != expectedGuardOwners.getValue(name)) {
+            throw unsupportedApk("component guards for $name differ from the tested build")
+        }
+    }
+    mentions.values.flatten().forEach { it.value = renamed(it.value) }
+}
+
+private val validatePermissionBytecode = patch(description = "Validate Messenger shared-permission bytecode") {
+    execute {
+        validateVersionCode(packageMetadata.versionCode)
+        checkedPermissionMethods()
+    }
+}
+
+private val renameManifest = patch(description = "Rename Messenger shared permissions") {
+    dependsOn(validatePermissionBytecode)
+    execute {
+        validateVersionCode(packageMetadata.versionCode)
+        document("AndroidManifest.xml").use { it.renameSharedPermissions() }
+    }
+}
+
+private fun Instruction.sharedName(): String? {
+    if (opcode != Opcode.CONST_STRING && opcode != Opcode.CONST_STRING_JUMBO) return null
+    val literal = ((this as? ReferenceInstruction)?.reference as? StringReference)?.string
+    return literal?.takeIf { it in dexNames }
+}
+
+private fun Method.hasSharedName(): Boolean =
+    implementation?.instructions?.any { it.sharedName() != null } == true
+
+private fun Method.siteId(index: Int): String =
+    "$definingClass->$name(${parameterTypes.joinToString("")})$returnType@$index"
+
+/** Checks the loads against the tested build, and each site's register in [registers] too, before any site is renamed. */
+internal fun validateDexSites(
+    sites: List<Pair<String, String>>,
+    expected: Map<String, String> = expectedDexSites,
+    versions: Map<String, List<Int>> = MessengerTarget.VERSIONS,
+    registers: Map<String, Int> = emptyMap(),
+) {
+    if (sites.size != expected.size) {
+        throw unsupportedApk("expected ${expected.size} permission loads, found ${sites.size}", versions)
+    }
+    if (sites.toMap() != expected) {
+        throw unsupportedApk("permission instruction sites differ from the tested build", versions)
+    }
+    // const-string/jumbo only reaches v0 to v255.
+    registers.entries.firstOrNull { it.value > 255 }?.let { (site, register) ->
+        throw unsupportedApk("$site uses v$register for a permission", versions)
+    }
+}
+
+private fun MutableMethod.renameSharedNames(): Int {
+    val sites = (implementation ?: return 0).instructions.withIndex()
+        .mapNotNull { (index, instruction) -> instruction.sharedName()?.let { index to it } }
+    for ((index, oldName) in sites.asReversed()) {
+        val register = getInstruction<OneRegisterInstruction>(index).registerA
+        replaceInstruction(index, "const-string/jumbo v$register, \"${renamed(oldName)}\"")
+    }
+    return sites.size
+}
+
+private fun checkedPermissionMethods(): List<MutableMethod> {
+    val classes = dexNames.flatMap { classDefByStrings(it, StringComparisonType.EQUALS) }
+        .filterNot { it.isExtension() }.map { it.type }.distinct()
+    val methods = classes.flatMap { type ->
+        mutableClassDefBy(type).methods.filter { it.hasSharedName() }
+    }
+    val registers = mutableMapOf<String, Int>()
+    val sites = methods.flatMap { method ->
+        method.implementation?.instructions?.withIndex()?.mapNotNull { (index, instruction) ->
+            instruction.sharedName()?.let {
+                registers[method.siteId(index)] = (instruction as OneRegisterInstruction).registerA
+                method.siteId(index) to it
+            }
+        } ?: emptyList()
+    }
+    validateDexSites(sites, expectedDexSitesFor(packageMetadata.versionCode), registers = registers)
+    return methods
+}
+
+private fun renameDexNames(): Int {
+    val methods = checkedPermissionMethods()
+    val renamed = methods.sumOf { it.renameSharedNames() }
+    if (renamed != expectedDexSitesFor(packageMetadata.versionCode).size || methods.any { it.hasSharedName() }) {
+        throw PatchException("$PATCH_NAME: not all permission loads were renamed")
+    }
+    return renamed
+}
+
+/**
+ * A re-signed Messenger and stock Meta apps otherwise declare two signature permissions under
+ * the same names. The shared prefix is deliberately the one used by Hushfacebook. Pairing the
+ * two patched apps still requires one signing key and separate cross-app trust checks.
+ */
+@Suppress("unused")
+val installBesideMetaAppsPatch = patch(
+    name = PATCH_NAME,
+    description = "Lets your patched Messenger install next to Facebook and other Meta apps. Without it, the apps can clash over shared permissions and the install can stop at a blank screen. Works as soon as you patch it in, with no switch.",
+    default = true,
+) {
+    category("Fixes")
+    compatibleWith(MessengerTarget.COMPATIBILITY)
+    dependsOn(renameManifest)
+    execute {
+        renameDexNames()
+    }
+}

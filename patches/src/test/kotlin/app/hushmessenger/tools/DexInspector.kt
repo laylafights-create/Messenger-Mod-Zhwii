@@ -1,0 +1,179 @@
+package app.hushmessenger.tools
+
+import com.android.tools.smali.dexlib2.DexFileFactory
+import com.android.tools.smali.dexlib2.Opcodes
+import com.android.tools.smali.dexlib2.iface.ClassDef
+import com.android.tools.smali.dexlib2.iface.Method
+import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.NarrowLiteralInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.OffsetInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.RegisterRangeInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.WideLiteralInstruction
+import com.android.tools.smali.dexlib2.iface.reference.FieldReference
+import com.android.tools.smali.dexlib2.iface.reference.MethodReference
+import com.android.tools.smali.dexlib2.iface.reference.StringReference
+import com.android.tools.smali.dexlib2.iface.reference.TypeReference
+import com.android.tools.smali.dexlib2.iface.value.StringEncodedValue
+import java.io.File
+
+/**
+ * Batched DEX queries against a stock Messenger APK. One load, many queries, one per line in a file:
+ *   -Ptarget=@queries.txt   with lines like  class:LX/Foo;  method:LX/Foo;->A01  callers:LX/Foo;->A01
+ *   strings:unsent  reads:LX/Foo;->A02  writes:LX/Foo;->A02  impl:LX/Iface;  uses:LX/Foo;  literal:1112
+ *   sig:<init>\(\[FFZZZ\)V   (a regex over every method's full id, for classes with no strings to find them by)
+ */
+object DexInspector {
+
+    private fun ClassDef.redexName(): String? = fields
+        .firstOrNull { it.name == "__redex_internal_original_name" }
+        ?.initialValue?.let { (it as? StringEncodedValue)?.value }
+
+    private fun Method.id() = "$definingClass->$name(${parameterTypes.joinToString("")})$returnType"
+
+    private fun loadClasses(apkPath: String): List<ClassDef> {
+        val container = DexFileFactory.loadDexContainer(File(apkPath), Opcodes.forApi(35))
+        return container.dexEntryNames.flatMap { container.getEntry(it)!!.dexFile.classes }
+    }
+
+    private fun dumpMethod(method: Method) {
+        val code = method.implementation ?: return println("    (abstract/native)")
+        println("  ${method.id()}  registers=${code.registerCount} params=${method.parameterTypes.size} static=${method.accessFlags and 0x8 != 0}")
+        var offset = 0
+        val offsets = code.instructions.map { insn -> offset.also { offset += insn.codeUnits } }
+        for ((i, insn) in code.instructions.withIndex()) {
+            val sb = StringBuilder("    [$i @${offsets[i]}] ${insn.opcode}")
+            when (insn) {
+                is FiveRegisterInstruction -> sb.append(
+                    listOf(insn.registerC, insn.registerD, insn.registerE, insn.registerF, insn.registerG)
+                        .take(insn.registerCount).joinToString(", ", " {", "}") { "v$it" },
+                )
+                is RegisterRangeInstruction -> sb.append(" {v${insn.startRegister}..v${insn.startRegister + insn.registerCount - 1}}")
+                is TwoRegisterInstruction -> sb.append(" v${insn.registerA}, v${insn.registerB}")
+                is OneRegisterInstruction -> sb.append(" v${insn.registerA}")
+            }
+            when (insn) {
+                is WideLiteralInstruction -> sb.append(", #${insn.wideLiteral}")
+                is NarrowLiteralInstruction -> sb.append(", #${insn.narrowLiteral}")
+            }
+            if (insn is OffsetInstruction) sb.append(", -> @${offsets[i] + insn.codeOffset}")
+            if (insn is ReferenceInstruction) {
+                when (val ref = insn.reference) {
+                    is MethodReference -> sb.append(", ${ref.definingClass}->${ref.name}(${ref.parameterTypes.joinToString("")})${ref.returnType}")
+                    is FieldReference -> sb.append(", ${ref.definingClass}->${ref.name}:${ref.type}")
+                    is StringReference -> sb.append(", \"${ref.string}\"")
+                    is TypeReference -> sb.append(", ${ref.type}")
+                    else -> sb.append(", $ref")
+                }
+            }
+            println(sb)
+        }
+    }
+
+    private fun splitMember(spec: String): Pair<String, String>? {
+        val parts = spec.split("->", limit = 2)
+        return if (parts.size == 2) parts[0] to parts[1] else null
+    }
+
+    private fun query(classes: List<ClassDef>, byType: Map<String, ClassDef>, q: String) {
+        println("\n==== $q ====")
+        // A malformed line says so and the batch goes on to the next query.
+        val parts = q.split(":", limit = 2)
+        if (parts.size < 2) return println("  expected kind:argument")
+        val (kind, arg) = parts
+        if (kind in setOf("method", "callers", "reads", "writes") && splitMember(arg) == null)
+            return println("  expected Lclass;->member")
+        // Every kind says when nothing matched, so a mistyped name never reads as "no callers".
+        var found = 0
+        fun show(line: String) { found++; println("  $line") }
+        // The class a member or type query names, when the APK doesn't define it.
+        val undefined = when (kind) {
+            "callers", "reads", "writes" -> arg.substringBefore("->")
+            "impl", "uses" -> arg
+            else -> null
+        }?.takeIf { it !in byType }
+        when (kind) {
+            "class" -> {
+                val cls = byType[arg] ?: return println("  not found")
+                show("${cls.type} extends ${cls.superclass} implements ${cls.interfaces}  redex=${cls.redexName()} access=0x${cls.accessFlags.toString(16)}")
+                cls.fields.filter { it.name != "__redex_internal_original_name" }
+                    .forEach { println("  field ${if (it.accessFlags and 0x8 != 0) "static " else ""}${it.name}: ${it.type}") }
+                cls.methods.forEach { println("  method ${it.id()} [${it.implementation?.instructions?.count() ?: 0}]") }
+            }
+            "method" -> {
+                val (cls, name) = splitMember(arg)!!
+                val c = byType[cls] ?: return println("  not found")
+                c.methods.filter { it.name == name || it.id() == arg }.forEach { found++; dumpMethod(it) }
+            }
+            "callers" -> {
+                val (cls, name) = splitMember(arg)!!
+                for (c in classes) for (m in c.methods) {
+                    val hit = m.implementation?.instructions?.any { insn ->
+                        val r = (insn as? ReferenceInstruction)?.reference as? MethodReference
+                        r != null && r.definingClass == cls && (r.name == name || "${r.definingClass}->${r.name}(${r.parameterTypes.joinToString("")})${r.returnType}" == arg)
+                    } ?: false
+                    if (hit) show("${m.id()}  redex=${c.redexName()}")
+                }
+            }
+            "strings" -> for (c in classes) for (m in c.methods) {
+                val hits = m.implementation?.instructions
+                    ?.mapNotNull { ((it as? ReferenceInstruction)?.reference as? StringReference)?.string }
+                    ?.filter { it.contains(arg) }.orEmpty()
+                if (hits.isNotEmpty()) show("${m.id()}  redex=${c.redexName()}  ${hits.distinct()}")
+            }
+            "reads", "writes" -> {
+                val (cls, name) = splitMember(arg)!!
+                for (c in classes) for (m in c.methods) {
+                    val hit = m.implementation?.instructions?.any { insn ->
+                        val r = (insn as? ReferenceInstruction)?.reference as? FieldReference
+                        // Opcode.name is the smali mnemonic ("iput-boolean"), not the enum constant.
+                        val isWrite = insn.opcode.name.let { it.startsWith("iput") || it.startsWith("sput") }
+                        r != null && r.definingClass == cls && r.name == name && isWrite == (kind == "writes")
+                    } ?: false
+                    if (hit) show("${m.id()}  redex=${c.redexName()}")
+                }
+            }
+            "impl" -> classes.filter { it.superclass == arg || arg in it.interfaces }
+                .forEach { show("${it.type} redex=${it.redexName()}") }
+            "uses" -> for (c in classes) for (m in c.methods) {
+                val sites = m.implementation?.instructions?.withIndex()?.filter { (_, insn) ->
+                    when (val r = (insn as? ReferenceInstruction)?.reference) {
+                        is TypeReference -> r.type == arg
+                        is MethodReference -> r.definingClass == arg
+                        is FieldReference -> r.definingClass == arg
+                        else -> false
+                    }
+                }?.map { (i, insn) -> "[$i] ${insn.opcode}" }.orEmpty()
+                if (sites.isNotEmpty()) show("${m.id()}  redex=${c.redexName()}  $sites")
+            }
+            "literal" -> {
+                val value = arg.toLong()
+                for (c in classes) for (m in c.methods) {
+                    val hit = m.implementation?.instructions?.any { insn ->
+                        (insn as? WideLiteralInstruction)?.wideLiteral == value
+                    } ?: false
+                    if (hit) show("${m.id()}  redex=${c.redexName()}")
+                }
+            }
+            "sig" -> {
+                val pattern = Regex(arg)
+                for (c in classes) for (m in c.methods) if (pattern.containsMatchIn(m.id())) show("${m.id()}  redex=${c.redexName()}")
+            }
+            else -> return println("  unknown query kind $kind (class, method, callers, strings, reads, writes, impl, uses, literal, sig)")
+        }
+        if (found == 0) println(undefined?.let { "  0 matches ($it isn't defined in the APK)" } ?: "  0 matches")
+    }
+
+    @JvmStatic fun main(args: Array<String>) {
+        require(args.size >= 2) { "Usage: DexInspector <apk-path> <query|query|...>" }
+        require(File(args[0]).isFile) { "APK not found: ${args[0]}" }
+        val classes = loadClasses(args[0])
+        val byType = classes.associateBy { it.type }
+        println("Loaded ${classes.size} classes")
+        // gradlew.bat hands arguments to cmd.exe, which treats | and > as operators, so long batches go in a file.
+        val queries = if (args[1].startsWith("@")) File(args[1].substring(1)).readLines() else args[1].split("|")
+        queries.map(String::trim).filter { it.isNotEmpty() && !it.startsWith("#") }.forEach { query(classes, byType, it) }
+    }
+}
